@@ -3,27 +3,68 @@ const express = require('express');
 const cookieSession = require('cookie-session');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const multer = require('multer');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
 const {
   pool, q, migrate, seedIfEmpty, ensureSuperAdmin,
-  seedDefaultRoles, backfillRoles, backfillUserRoles,
+  seedDefaultRoles, backfillRoles, backfillUserRoles, writeAudit,
 } = require('./db');
 const {
   esc, money, fmtDate, fmtDt, MOVE_TYPES, applyMovement, can, PERMISSION_GROUPS, ALL_PERMISSIONS,
+  parseCsv, findCol,
 } = require('./helpers');
 const { layoutHead, layoutFoot, flashHtml, actingBanner, csrfField, modal, field, tabs } = require('./views');
 
 const app = express();
+
+// Render terminates TLS at its edge proxy; trusting the first proxy hop lets
+// Express see the real client IP (for rate limiting) and know the original
+// request was HTTPS (so secure cookies and req.secure work correctly).
+app.set('trust proxy', 1);
+
+// Security headers. CSP is left off deliberately: the UI relies on small
+// inline onclick handlers (e.g. closing a modal) and inline <style>. A strict
+// CSP would break those without a larger template refactor; every other
+// helmet protection (HSTS, X-Frame-Options, X-Content-Type-Options,
+// Referrer-Policy, etc.) is still fully active.
+app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+// Photos are stored in Postgres (bytea), not on local disk: Render's filesystem
+// is wiped on every deploy/restart, so anything written to disk would be lost.
+const uploadImage = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => cb(null, /^image\/(png|jpe?g|webp|gif)$/.test(file.mimetype)),
+});
+const uploadCsv = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+});
 app.use(
   cookieSession({
     name: 'sess',
     secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
     maxAge: 30 * 24 * 60 * 60 * 1000,
     sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',
   })
 );
+
+// Brute-force protection on authentication endpoints. Keyed by IP; a failed
+// login doesn't consume the same bucket as a successful one, so normal users
+// never notice this.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Te veel pogingen vanaf dit adres. Probeer het over enkele minuten opnieuw.',
+});
 
 // ---------------------------------------------------------------- helpers
 function ensureCsrf(req) {
@@ -130,7 +171,7 @@ app.get('/login', (req, res) => {
     ${layoutFoot(null)}`);
 });
 
-app.post('/login', async (req, res) => {
+app.post('/login', authLimiter, async (req, res) => {
   if (!csrfOk(req)) return res.status(400).send('Ongeldige sessie.');
   const email = String(req.body.email || '').trim().toLowerCase();
   const { rows } = await q('SELECT * FROM users WHERE email = $1 AND active = true', [email]);
@@ -161,7 +202,7 @@ app.get('/register', (req, res) => {
     ${layoutFoot(null)}`);
 });
 
-app.post('/register', async (req, res) => {
+app.post('/register', authLimiter, async (req, res) => {
   if (!csrfOk(req)) return res.status(400).send('Ongeldige sessie.');
   const company = String(req.body.company || '').trim();
   const name = String(req.body.name || '').trim();
@@ -234,6 +275,64 @@ app.get('/dashboard', requireAuth, async (req, res) => {
   res.send(page(req, 'dashboard', html));
 });
 
+// ================================================================== PHOTOS
+// Fallback avatar/logo: a simple generated SVG (initials on a green circle),
+// so the UI never shows a broken image before anyone has uploaded a photo.
+function initials(name) {
+  return String(name || '?').trim().split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase() || '?';
+}
+function fallbackAvatarSvg(name) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80"><rect width="80" height="80" rx="40" fill="#0e3d2c"/><text x="40" y="47" font-family="system-ui,sans-serif" font-size="30" font-weight="700" fill="#eafaf1" text-anchor="middle">${esc(initials(name))}</text></svg>`;
+}
+function fallbackLogoSvg() {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80"><rect width="80" height="80" rx="18" fill="#0e3d2c"/><text x="40" y="52" font-size="34" text-anchor="middle">🌿</text></svg>`;
+}
+function sendSvg(res, svg) {
+  res.setHeader('Content-Type', 'image/svg+xml');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(svg);
+}
+
+app.get('/avatar/:id', async (req, res) => {
+  const { rows } = await q('SELECT name, avatar, avatar_mime FROM users WHERE id=$1', [Number(req.params.id)]);
+  const u = rows[0];
+  if (!u || !u.avatar) return sendSvg(res, fallbackAvatarSvg(u ? u.name : '?'));
+  res.setHeader('Content-Type', u.avatar_mime || 'image/jpeg');
+  res.setHeader('Cache-Control', 'private, max-age=300');
+  res.send(u.avatar);
+});
+app.get('/logo/:id', async (req, res) => {
+  const { rows } = await q('SELECT logo, logo_mime FROM companies WHERE id=$1', [Number(req.params.id)]);
+  const c = rows[0];
+  if (!c || !c.logo) return sendSvg(res, fallbackLogoSvg());
+  res.setHeader('Content-Type', c.logo_mime || 'image/jpeg');
+  res.setHeader('Cache-Control', 'private, max-age=300');
+  res.send(c.logo);
+});
+
+app.get('/profile', requireAuth, (req, res) => {
+  const html = `<h1>Mijn profiel</h1>
+    <div class="card" style="max-width:480px"><div class="bd">
+      <div class="row" style="margin-bottom:16px">
+        <img src="/avatar/${req.user.id}?t=${Date.now()}" alt="" style="width:64px;height:64px;border-radius:50%;object-fit:cover">
+        <div><div style="font-weight:700">${esc(req.user.name)}</div><div class="muted" style="font-size:13px">${esc(req.user.email)}</div><div class="muted" style="font-size:12px">${esc(req.user.role_name)} · ${esc(req.user.company_name)}</div></div>
+      </div>
+      <form method="post" action="/profile/avatar" enctype="multipart/form-data">
+        ${csrfField(req.user.csrf)}
+        <div class="field"><label>Nieuwe profielfoto (JPG/PNG/WEBP, max 2MB)</label><input type="file" name="avatar" accept="image/png,image/jpeg,image/webp,image/gif" required></div>
+        <button class="btn btn-p">Foto opslaan</button>
+      </form>
+    </div></div>`;
+  res.send(page(req, 'profile', html));
+});
+app.post('/profile/avatar', requireAuth, uploadImage.single('avatar'), async (req, res) => {
+  if (!csrfOk(req)) return res.status(400).send('Ongeldige sessie.');
+  if (!req.file) { flash(req, 'Kies een geldige afbeelding (JPG/PNG/WEBP/GIF, max 2MB).', 'err'); return res.redirect('/profile'); }
+  await q('UPDATE users SET avatar=$1, avatar_mime=$2 WHERE id=$3', [req.file.buffer, req.file.mimetype, req.user.id]);
+  flash(req, 'Profielfoto bijgewerkt.');
+  res.redirect('/profile');
+});
+
 // ================================================================== INVENTORY
 function invTabs(active) {
   return tabs([['/inventory', 'Producten', 'products'], ['/inventory/history', 'Historie', 'history'], ['/inventory/orders', 'Bestellijst', 'orders']], active);
@@ -268,6 +367,7 @@ app.get('/inventory', requireAuth, requireCap('inventory.view'), async (req, res
 
   let html = `<div class="between"><h1>Voorraad</h1><div class="row">`;
   if (can(req.user, 'reports.view')) html += `<a class="btn" href="/inventory/export.csv">Export CSV</a>`;
+  if (can(req.user, 'inventory.create')) html += importCsvModal(req);
   if (can(req.user, 'inventory.create')) html += quickAddCategoryModal(req, '/inventory');
   if (can(req.user, 'inventory.create')) html += productModal(req, null, cats, sups, locs);
   html += `</div></div>`;
@@ -310,6 +410,14 @@ function quickAddCategoryModal(req, returnTo) {
     <button class="btn btn-p">Toevoegen</button></form></div>`;
   return modal('btn', '+ Categorie', 'Nieuwe categorie', inner);
 }
+function importCsvModal(req) {
+  const inner = `<div class="bd"><form method="post" action="/inventory/import" enctype="multipart/form-data">
+    ${csrfField(req.user.csrf)}
+    <p class="muted" style="font-size:12.5px;margin:0 0 12px">Importeer een CSV (bijv. van Sligro). Kolommen worden automatisch herkend: naam, SKU/artikelnummer, prijs, voorraad, categorie, barcode. Bestaande producten worden herkend op SKU en bijgewerkt; nieuwe worden toegevoegd.</p>
+    <div class="field"><label>CSV-bestand</label><input type="file" name="file" accept=".csv,text/csv" required></div>
+    <button class="btn btn-p">Importeren</button></form></div>`;
+  return modal('btn', '⇧ Importeren', 'CSV importeren', inner);
+}
 function productModal(req, p, cats, sups, locs) {
   const isEdit = !!p;
   p = p || {};
@@ -351,6 +459,7 @@ app.post('/inventory', requireAuth, requireCsrf, requireCap('inventory.create'),
     await q('INSERT INTO stock_movements (company_id,product_id,type,qty,note,user_name) VALUES ($1,$2,$3,$4,$5,$6)',
       [cid, rows[0].id, 'levering', stock, 'Beginvoorraad', req.user.name]);
   }
+  await writeAudit(cid, req.user.name, 'product.create', `${req.body.name} (${req.body.sku})`);
   flash(req, 'Product toegevoegd.');
   res.redirect('/inventory');
 });
@@ -363,12 +472,14 @@ app.post('/inventory/:id/update', requireAuth, requireCsrf, requireCap('inventor
     [req.body.name, req.body.sku, nn(req.body.barcode), req.body.unit || 'stuk', price, parseInt(req.body.min_stock, 10) || 0,
       nn(req.body.category_id), nn(req.body.supplier_id), nn(req.body.location_id), id, cid]
   );
+  await writeAudit(cid, req.user.name, 'product.update', `${req.body.name} (${req.body.sku})`);
   flash(req, 'Product bijgewerkt.');
   res.redirect('/inventory');
 });
 app.post('/inventory/:id/delete', requireAuth, requireCsrf, requireCap('inventory.delete'), async (req, res) => {
   const cid = req.user.effectiveCompanyId;
   await q('DELETE FROM products WHERE id=$1 AND company_id=$2', [Number(req.params.id), cid]);
+  await writeAudit(cid, req.user.name, 'product.delete', `product #${req.params.id}`);
   flash(req, 'Product verwijderd.');
   res.redirect('/inventory');
 });
@@ -388,8 +499,100 @@ app.post('/inventory/:id/move', requireAuth, requireCsrf, requireCap('inventory.
         [cid, prod.id, type, r.delta, nn(req.body.note), req.user.name]);
       await client.query('COMMIT');
     } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    await writeAudit(cid, req.user.name, 'stock.move', `${MOVE_TYPES[type]}: ${prod.name} ${r.delta >= 0 ? '+' : ''}${r.delta} → ${r.new}`);
     flash(req, `Voorraad bijgewerkt: ${prod.name} → ${r.new} ${prod.unit}.`);
   }
+  res.redirect('/inventory');
+});
+
+app.post('/inventory/import', requireAuth, uploadCsv.single('file'), requireCap('inventory.create'), async (req, res) => {
+  if (!csrfOk(req)) return res.status(400).send('Ongeldige sessie.');
+  const cid = req.user.effectiveCompanyId;
+  if (!req.file) { flash(req, 'Kies een CSV-bestand.', 'err'); return res.redirect('/inventory'); }
+
+  const { headers, rows } = parseCsv(req.file.buffer.toString('utf8'));
+  const iSku = findCol(headers, ['sku', 'artikelnummer', 'artikelcode', 'code', 'artnr']);
+  const iName = findCol(headers, ['naam', 'name', 'omschrijving', 'artikelnaam', 'productnaam']);
+  const iPrice = findCol(headers, ['prijs', 'price', 'verkoopprijs', 'inkoopprijs']);
+  const iStock = findCol(headers, ['voorraad', 'aantal', 'stock', 'qty', 'hoeveelheid']);
+  const iMin = findCol(headers, ['minvoorraad', 'min', 'minstock', 'minimumvoorraad']);
+  const iBarcode = findCol(headers, ['barcode', 'ean', 'ean13']);
+  const iCat = findCol(headers, ['categorie', 'category', 'groep', 'productgroep']);
+  const iUnit = findCol(headers, ['eenheid', 'unit']);
+
+  if (iSku < 0) {
+    flash(req, 'Kon geen SKU/artikelnummer-kolom herkennen in dit CSV-bestand.', 'err');
+    return res.redirect('/inventory');
+  }
+
+  let created = 0, updated = 0, skipped = 0;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const catCache = new Map();
+    async function resolveCategory(name) {
+      const key = name.trim().toLowerCase();
+      if (catCache.has(key)) return catCache.get(key);
+      const existing = await client.query('SELECT id FROM categories WHERE company_id=$1 AND lower(name)=$2', [cid, key]);
+      let catId;
+      if (existing.rows[0]) catId = existing.rows[0].id;
+      else {
+        const created2 = await client.query('INSERT INTO categories (company_id,name) VALUES ($1,$2) RETURNING id', [cid, name.trim()]);
+        catId = created2.rows[0].id;
+      }
+      catCache.set(key, catId);
+      return catId;
+    }
+
+    for (const row of rows) {
+      const sku = (row[iSku] || '').trim();
+      if (!sku) { skipped++; continue; }
+      const name = iName >= 0 && row[iName] ? row[iName].trim() : sku;
+      const priceVal = iPrice >= 0 && row[iPrice] !== '' ? parseFloat(String(row[iPrice]).replace(',', '.')) : undefined;
+      const stockVal = iStock >= 0 && row[iStock] !== '' ? parseInt(row[iStock], 10) : undefined;
+      const minVal = iMin >= 0 && row[iMin] !== '' ? parseInt(row[iMin], 10) : undefined;
+      const barcodeVal = iBarcode >= 0 && row[iBarcode] ? row[iBarcode].trim() : undefined;
+      const unitVal = iUnit >= 0 && row[iUnit] ? row[iUnit].trim() : undefined;
+      const catId = iCat >= 0 && row[iCat] && row[iCat].trim() ? await resolveCategory(row[iCat]) : undefined;
+
+      const existing = await client.query('SELECT * FROM products WHERE company_id=$1 AND lower(sku)=lower($2)', [cid, sku]);
+      if (existing.rows[0]) {
+        const p = existing.rows[0];
+        await client.query(
+          `UPDATE products SET name=$1, price=$2, min_stock=$3, barcode=COALESCE($4,barcode), unit=COALESCE($5,unit), category_id=COALESCE($6,category_id) WHERE id=$7`,
+          [name, priceVal !== undefined && !Number.isNaN(priceVal) ? priceVal : p.price, minVal !== undefined && !Number.isNaN(minVal) ? minVal : p.min_stock, barcodeVal, unitVal, catId, p.id]
+        );
+        if (stockVal !== undefined && !Number.isNaN(stockVal) && stockVal !== p.stock) {
+          const r = applyMovement(p.stock, 'telling', stockVal);
+          await client.query('UPDATE products SET stock=$1 WHERE id=$2', [r.new, p.id]);
+          await client.query('INSERT INTO stock_movements (company_id,product_id,type,qty,note,user_name) VALUES ($1,$2,$3,$4,$5,$6)',
+            [cid, p.id, 'telling', r.delta, 'CSV-import', req.user.name]);
+        }
+        updated++;
+      } else {
+        const stock = stockVal !== undefined && !Number.isNaN(stockVal) ? stockVal : 0;
+        const created2 = await client.query(
+          `INSERT INTO products (company_id,name,sku,barcode,unit,price,min_stock,category_id,stock) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+          [cid, name, sku, barcodeVal || null, unitVal || 'stuk', priceVal !== undefined && !Number.isNaN(priceVal) ? priceVal : 0, minVal !== undefined && !Number.isNaN(minVal) ? minVal : 0, catId || null, stock]
+        );
+        if (stock > 0) {
+          await client.query('INSERT INTO stock_movements (company_id,product_id,type,qty,note,user_name) VALUES ($1,$2,$3,$4,$5,$6)',
+            [cid, created2.rows[0].id, 'levering', stock, 'CSV-import (nieuw)', req.user.name]);
+        }
+        created++;
+      }
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    flash(req, 'Import mislukt: ' + e.message, 'err');
+    return res.redirect('/inventory');
+  } finally {
+    client.release();
+  }
+
+  await writeAudit(cid, req.user.name, 'inventory.import', `${created} nieuw, ${updated} bijgewerkt, ${skipped} overgeslagen (bestand: ${req.file.originalname})`);
+  flash(req, `CSV-import voltooid: ${created} nieuw, ${updated} bijgewerkt${skipped ? `, ${skipped} overgeslagen (geen SKU)` : ''}.`);
   res.redirect('/inventory');
 });
 
@@ -455,6 +658,7 @@ function settingsTabs(active, user) {
     ['/settings/roles', 'Rollen', 'roles', 'roles.manage'],
     ['/settings/inventory', 'Voorraad-instellingen', 'inventory_settings', 'settings.manage'],
     ['/settings/company', 'Bedrijfsprofiel', 'company_profile', 'settings.manage'],
+    ['/settings/activity', 'Activiteit', 'activity', 'settings.manage'],
   ].filter(([, , , cap]) => can(user, cap)).map(([h, l, k]) => [h, l, k]);
   return tabs(all, active);
 }
@@ -480,7 +684,7 @@ app.get('/settings/users', requireAuth, requireCap('users.manage'), async (req, 
       <div class="field"><label>Rol</label><select name="role_id">${roles.map((r) => `<option value="${r.id}" ${r.key === 'medewerker' ? 'selected' : ''}>${esc(r.name)}</option>`).join('')}</select></div>
     </div><button class="btn btn-p">Gebruiker toevoegen</button></form></div></div>`;
   html += `<div class="card" style="overflow-x:auto"><table><thead><tr><th>Naam</th><th>E-mail</th><th>Rol</th><th></th></tr></thead><tbody>`;
-  html += users.map((u) => `<tr><td><strong>${esc(u.name)}</strong>${u.id === req.user.id ? ' <span class="badge b-info">jij</span>' : ''}</td><td class="mono muted">${esc(u.email)}</td><td><span class="badge b-neutral">${esc(u.role_name || '—')}</span></td><td class="right">${u.id === req.user.id ? '' : `<form method="post" action="/settings/users/${u.id}/delete" onsubmit="return confirm('Gebruiker verwijderen?')">${csrfField(req.user.csrf)}<button class="btn btn-sm btn-d">Verwijderen</button></form>`}</td></tr>`).join('');
+  html += users.map((u) => `<tr><td><div class="row" style="gap:8px"><img src="/avatar/${u.id}" alt="" style="width:28px;height:28px;border-radius:50%;object-fit:cover"><strong>${esc(u.name)}</strong>${u.id === req.user.id ? ' <span class="badge b-info">jij</span>' : ''}</div></td><td class="mono muted">${esc(u.email)}</td><td><span class="badge b-neutral">${esc(u.role_name || '—')}</span></td><td class="right">${u.id === req.user.id ? '' : `<form method="post" action="/settings/users/${u.id}/delete" onsubmit="return confirm('Gebruiker verwijderen?')">${csrfField(req.user.csrf)}<button class="btn btn-sm btn-d">Verwijderen</button></form>`}</td></tr>`).join('');
   html += `</tbody></table></div></div>`;
   res.send(page(req, 'users', html));
 });
@@ -498,6 +702,7 @@ app.post('/settings/users', requireAuth, requireCsrf, requireCap('users.manage')
   const hash = await bcrypt.hash(req.body.password, 10);
   await q('INSERT INTO users (company_id,name,email,password_hash,role,role_id) VALUES ($1,$2,$3,$4,$5,$6)',
     [cid, req.body.name, email, hash, roleCheck.rows[0].key, roleCheck.rows[0].id]);
+  await writeAudit(cid, req.user.name, 'user.create', `${req.body.name} <${email}> (${roleCheck.rows[0].key})`);
   flash(req, 'Gebruiker toegevoegd.');
   res.redirect('/settings/users');
 });
@@ -506,6 +711,7 @@ app.post('/settings/users/:id/delete', requireAuth, requireCsrf, requireCap('use
   const id = Number(req.params.id);
   if (id === req.user.id) { flash(req, 'Je kunt jezelf niet verwijderen.', 'err'); return res.redirect('/settings/users'); }
   await q('DELETE FROM users WHERE id=$1 AND company_id=$2', [id, cid]);
+  await writeAudit(cid, req.user.name, 'user.delete', `gebruiker #${id}`);
   flash(req, 'Gebruiker verwijderd.');
   res.redirect('/settings/users');
 });
@@ -551,6 +757,7 @@ app.post('/settings/roles', requireAuth, requireCsrf, requireCap('roles.manage')
   const perms = [].concat(req.body.permissions || []).filter((p) => ALL_PERMISSIONS.includes(p));
   const key = 'r' + Date.now();
   await q('INSERT INTO roles (company_id,key,name,permissions) VALUES ($1,$2,$3,$4)', [cid, key, req.body.name, perms]);
+  await writeAudit(cid, req.user.name, 'role.create', `${req.body.name} (${perms.join(', ') || 'geen rechten'})`);
   flash(req, 'Rol aangemaakt.');
   res.redirect('/settings/roles');
 });
@@ -559,6 +766,7 @@ app.post('/settings/roles/:id/update', requireAuth, requireCsrf, requireCap('rol
   const id = Number(req.params.id);
   const perms = [].concat(req.body.permissions || []).filter((p) => ALL_PERMISSIONS.includes(p));
   await q('UPDATE roles SET name=$1, permissions=$2 WHERE id=$3 AND company_id=$4', [req.body.name, perms, id, cid]);
+  await writeAudit(cid, req.user.name, 'role.update', `${req.body.name} (${perms.join(', ') || 'geen rechten'})`);
   flash(req, 'Rol bijgewerkt.');
   res.redirect('/settings/roles');
 });
@@ -568,6 +776,7 @@ app.post('/settings/roles/:id/delete', requireAuth, requireCsrf, requireCap('rol
   const inUse = await q('SELECT COUNT(*)::int c FROM users WHERE role_id=$1', [id]);
   if (inUse.rows[0].c > 0) { flash(req, 'Deze rol is nog aan gebruikers toegekend en kan niet verwijderd worden.', 'err'); return res.redirect('/settings/roles'); }
   await q('DELETE FROM roles WHERE id=$1 AND company_id=$2', [id, cid]);
+  await writeAudit(cid, req.user.name, 'role.delete', `rol #${id}`);
   flash(req, 'Rol verwijderd.');
   res.redirect('/settings/roles');
 });
@@ -596,12 +805,13 @@ app.get('/settings/inventory', requireAuth, requireCap('settings.manage'), async
   html += `</div>`;
   res.send(page(req, 'inventory_settings', html));
 });
-for (const [seg, tbl] of [['categories', 'categories'], ['suppliers', 'suppliers'], ['locations', 'locations']]) {
+for (const [seg, tbl, label] of [['categories', 'categories', 'Categorie'], ['suppliers', 'suppliers', 'Leverancier'], ['locations', 'locations', 'Locatie']]) {
   app.post(`/settings/inventory/${seg}`, requireAuth, requireCsrf, requireCap('settings.manage'), async (req, res) => {
     const cid = req.user.effectiveCompanyId;
     if (req.body.name) {
       if (tbl === 'suppliers') await q('INSERT INTO suppliers (company_id,name,email,phone) VALUES ($1,$2,$3,$4)', [cid, req.body.name, nn(req.body.email), nn(req.body.phone)]);
       else await q(`INSERT INTO ${tbl} (company_id,name) VALUES ($1,$2)`, [cid, req.body.name]);
+      await writeAudit(cid, req.user.name, `${tbl}.create`, `${label}: ${req.body.name}`);
       flash(req, 'Toegevoegd.');
     }
     res.redirect(nn(req.body.return_to) || '/settings/inventory');
@@ -609,6 +819,7 @@ for (const [seg, tbl] of [['categories', 'categories'], ['suppliers', 'suppliers
   app.post(`/settings/inventory/${seg}/:id/delete`, requireAuth, requireCsrf, requireCap('settings.manage'), async (req, res) => {
     const cid = req.user.effectiveCompanyId;
     await q(`DELETE FROM ${tbl} WHERE id=$1 AND company_id=$2`, [Number(req.params.id), cid]);
+    await writeAudit(cid, req.user.name, `${tbl}.delete`, `${label} #${req.params.id}`);
     flash(req, 'Verwijderd.');
     res.redirect('/settings/inventory');
   });
@@ -621,19 +832,51 @@ app.get('/settings/company', requireAuth, requireCap('settings.manage'), async (
   const company = rows[0];
   let html = `<h1>Instellingen</h1>` + settingsTabs('company_profile', req.user);
   html += `<div class="card" style="max-width:480px"><div class="bd">
-    <form method="post" action="/settings/company">
+    <div class="row" style="margin-bottom:16px">
+      <img src="/logo/${cid}?t=${Date.now()}" alt="" style="width:56px;height:56px;border-radius:14px;object-fit:cover">
+      <div class="muted" style="font-size:12px">Huidig logo</div>
+    </div>
+    <form method="post" action="/settings/company" enctype="multipart/form-data">
       ${csrfField(req.user.csrf)}
       <div class="field"><label>Bedrijfsnaam</label><input name="name" required value="${esc(company.name)}"></div>
+      <div class="field"><label>Logo (JPG/PNG/WEBP, max 2MB — optioneel)</label><input type="file" name="logo" accept="image/png,image/jpeg,image/webp,image/gif"></div>
       <button class="btn btn-p">Opslaan</button>
     </form></div></div>`;
   res.send(page(req, 'company_profile', html));
 });
-app.post('/settings/company', requireAuth, requireCsrf, requireCap('settings.manage'), async (req, res) => {
+app.post('/settings/company', requireAuth, uploadImage.single('logo'), requireCap('settings.manage'), async (req, res) => {
+  if (!csrfOk(req)) return res.status(400).send('Ongeldige sessie.');
   const cid = req.user.effectiveCompanyId;
   if (!req.body.name) { flash(req, 'Bedrijfsnaam is verplicht.', 'err'); return res.redirect('/settings/company'); }
-  await q('UPDATE companies SET name=$1 WHERE id=$2', [req.body.name, cid]);
+  if (req.file) await q('UPDATE companies SET name=$1, logo=$2, logo_mime=$3 WHERE id=$4', [req.body.name, req.file.buffer, req.file.mimetype, cid]);
+  else await q('UPDATE companies SET name=$1 WHERE id=$2', [req.body.name, cid]);
+  await writeAudit(cid, req.user.name, 'company.update', req.body.name + (req.file ? ' (+ nieuw logo)' : ''));
   flash(req, 'Bedrijfsprofiel bijgewerkt.');
   res.redirect('/settings/company');
+});
+
+// ---- Activity log ----
+// A visible audit trail is both a real security control (who changed what,
+// when) and a trust signal for larger organisations evaluating the app.
+const ACTION_LABELS = {
+  'product.create': 'Product toegevoegd', 'product.update': 'Product bewerkt', 'product.delete': 'Product verwijderd',
+  'stock.move': 'Voorraadmutatie', 'inventory.import': 'CSV-import',
+  'user.create': 'Gebruiker toegevoegd', 'user.delete': 'Gebruiker verwijderd',
+  'role.create': 'Rol aangemaakt', 'role.update': 'Rol bewerkt', 'role.delete': 'Rol verwijderd',
+  'categories.create': 'Categorie toegevoegd', 'categories.delete': 'Categorie verwijderd',
+  'suppliers.create': 'Leverancier toegevoegd', 'suppliers.delete': 'Leverancier verwijderd',
+  'locations.create': 'Locatie toegevoegd', 'locations.delete': 'Locatie verwijderd',
+  'company.update': 'Bedrijfsprofiel bijgewerkt', 'company.create': 'Bedrijf aangemaakt', 'company.delete': 'Bedrijf verwijderd',
+};
+app.get('/settings/activity', requireAuth, requireCap('settings.manage'), async (req, res) => {
+  const cid = req.user.effectiveCompanyId;
+  const { rows } = await q('SELECT * FROM audit_log WHERE company_id=$1 ORDER BY created_at DESC LIMIT 200', [cid]);
+  let html = `<h1>Instellingen</h1>` + settingsTabs('activity', req.user);
+  html += `<p class="muted" style="margin-top:-6px">De laatste 200 wijzigingen in dit bedrijf, voor jouw eigen inzicht en verantwoording.</p>`;
+  html += `<div class="card" style="overflow-x:auto"><table><thead><tr><th>Datum</th><th>Door</th><th>Actie</th><th>Details</th></tr></thead><tbody>`;
+  html += rows.length ? rows.map((r) => `<tr><td class="nowrap">${fmtDt(r.created_at)}</td><td>${esc(r.user_name)}</td><td><span class="badge b-neutral">${esc(ACTION_LABELS[r.action] || r.action)}</span></td><td class="muted">${esc(r.details || '')}</td></tr>`).join('') : `<tr><td colspan="4" class="muted" style="padding:26px;text-align:center">Nog geen activiteit.</td></tr>`;
+  html += `</tbody></table></div>`;
+  res.send(page(req, 'activity', html));
 });
 
 // ================================================================== COMPANIES (super-admin)
@@ -688,6 +931,7 @@ app.post('/companies', requireAuth, requireCsrf, async (req, res) => {
     }
     await client.query('COMMIT');
   } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  await writeAudit(newCid, req.user.name, 'company.create', `door platform-beheerder ${req.user.name}`);
   flash(req, `Bedrijf "${req.body.company}" aangemaakt.`);
   res.redirect('/companies');
 });
@@ -707,8 +951,10 @@ app.post('/companies/:id/delete', requireAuth, requireCsrf, async (req, res) => 
   if (!req.user.is_super) { flash(req, 'Geen rechten.', 'err'); return res.redirect('/companies'); }
   const id = Number(req.params.id);
   if (id === req.user.homeCompanyId) { flash(req, 'Je kunt je eigen bedrijf niet verwijderen.', 'err'); return res.redirect('/companies'); }
+  const co = await q('SELECT name FROM companies WHERE id=$1', [id]);
   await q('DELETE FROM companies WHERE id=$1', [id]);
   if (req.session.actingCompanyId === id) delete req.session.actingCompanyId;
+  await writeAudit(null, req.user.name, 'company.delete', `${co.rows[0] ? co.rows[0].name : '#' + id} verwijderd door platform-beheerder ${req.user.name}`);
   flash(req, 'Bedrijf verwijderd.');
   res.redirect('/companies');
 });
@@ -717,6 +963,17 @@ app.post('/companies/:id/delete', requireAuth, requireCsrf, async (req, res) => 
 app.get('/healthz', async (req, res) => {
   try { await q('SELECT 1'); res.status(200).send('ok'); }
   catch (e) { res.status(500).send('db error: ' + e.message); }
+});
+
+// ================================================================== errors
+app.use((err, req, res, next) => {
+  if (err && err.name === 'MulterError') {
+    const msg = err.code === 'LIMIT_FILE_SIZE' ? 'Bestand is te groot.' : 'Uploaden mislukt: ' + err.message;
+    flash(req, msg, 'err');
+    return res.redirect(req.get('referer') || '/dashboard');
+  }
+  console.error(err);
+  res.status(500).send('Er ging iets mis.');
 });
 
 const PORT = process.env.PORT || 3000;
