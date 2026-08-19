@@ -67,7 +67,57 @@ function can(user, cap) {
   return false;
 }
 
+/**
+ * Minimal dependency-free CSV parser. Auto-detects ',' vs ';' as delimiter
+ * (Sligro/Excel exports commonly use ';'), strips a UTF-8 BOM, and handles
+ * quoted fields (including embedded delimiters/newlines and "" escaping).
+ * Returns { headers: string[], rows: string[][] }.
+ */
+function parseCsv(text) {
+  text = String(text || '').replace(/^\uFEFF/, '');
+  const firstLine = text.split(/\r?\n/, 1)[0] || '';
+  const delim = (firstLine.match(/;/g) || []).length >= (firstLine.match(/,/g) || []).length ? ';' : ',';
+
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === delim) {
+      row.push(field); field = '';
+    } else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      if (row.some((f) => f !== '')) rows.push(row);
+      row = [];
+    } else {
+      field += c;
+    }
+  }
+  if (field !== '' || row.length) { row.push(field); if (row.some((f) => f !== '')) rows.push(row); }
+
+  const headers = (rows.shift() || []).map((h) => h.trim().toLowerCase());
+  return { headers, rows };
+}
+
+/** Find the index of the first header matching any of the given candidate names. */
+function findCol(headers, candidates) {
+  for (const cand of candidates) {
+    const i = headers.indexOf(cand);
+    if (i >= 0) return i;
+  }
+  return -1;
+}
+
 module.exports = {
   esc, money, fmtDate, fmtDt, MOVE_TYPES, applyMovement, can,
-  PERMISSION_GROUPS, ALL_PERMISSIONS,
+  PERMISSION_GROUPS, ALL_PERMISSIONS, parseCsv, findCol,
 };
