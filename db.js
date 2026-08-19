@@ -97,9 +97,28 @@ async function migrate() {
     CREATE INDEX IF NOT EXISTS idx_movements_company ON stock_movements(company_id);
     CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id);
     CREATE INDEX IF NOT EXISTS idx_roles_company ON roles(company_id);
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER REFERENCES companies(id) ON DELETE SET NULL,
+      user_name TEXT NOT NULL,
+      action TEXT NOT NULL,
+      details TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_company ON audit_log(company_id, created_at DESC);
   `);
   // Safe to run on every boot even against a pre-existing (older) database.
   await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role_id INTEGER REFERENCES roles(id) ON DELETE SET NULL;`);
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar BYTEA;`);
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_mime TEXT;`);
+  await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo BYTEA;`);
+  await q(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS logo_mime TEXT;`);
+}
+
+/** Write one row to the activity log. Never throws — logging failures must not break the request. */
+async function writeAudit(companyId, userName, action, details) {
+  try { await q('INSERT INTO audit_log (company_id,user_name,action,details) VALUES ($1,$2,$3,$4)', [companyId, userName, action, details || null]); }
+  catch (e) { console.error('audit log write failed:', e.message); }
 }
 
 /** Insert the three default roles for a company; returns { admin, manager, medewerker } role rows. */
@@ -212,5 +231,5 @@ async function ensureSuperAdmin() {
 
 module.exports = {
   pool, q, migrate, seedIfEmpty, ensureSuperAdmin,
-  seedDefaultRoles, backfillRoles, backfillUserRoles, DEFAULT_ROLES,
+  seedDefaultRoles, backfillRoles, backfillUserRoles, DEFAULT_ROLES, writeAudit,
 };
