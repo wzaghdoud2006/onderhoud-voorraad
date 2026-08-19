@@ -113,7 +113,7 @@ function navLink(href, label, active, key) {
 function sidebar(user, active) {
   const showSettings = ['users.manage', 'roles.manage', 'settings.manage'].some((c) => require('./helpers').can(user, c));
   return `<aside class="sidebar">
-    <div class="sb-brand">🌿 Bedrijfsbeheer</div>
+    <div class="sb-brand"><img src="/logo/${user.effectiveCompanyId}" alt="" style="width:26px;height:26px;border-radius:7px;object-fit:cover"> Bedrijfsbeheer</div>
     <div class="sb-company">
       <div class="name">${esc(user.company_name)}</div>
       <div class="role">${esc(user.role_name || '')}</div>
@@ -122,11 +122,14 @@ function sidebar(user, active) {
     <nav class="sb-nav">
       ${navLink('/dashboard', 'Overzicht', active, 'dashboard')}
       ${navLink('/inventory', 'Voorraad', active, 'inventory')}
-      ${showSettings ? `<div class="sb-group-label">Beheer</div>${navLink('/settings/users', 'Instellingen', ['settings', 'users', 'roles', 'inventory_settings', 'company_profile'].includes(active) ? 'settings' : active, 'settings')}` : ''}
+      ${showSettings ? `<div class="sb-group-label">Beheer</div>${navLink('/settings/users', 'Instellingen', ['settings', 'users', 'roles', 'inventory_settings', 'company_profile', 'activity'].includes(active) ? 'settings' : active, 'settings')}` : ''}
       ${user.is_super ? `<div class="sb-group-label">Platform</div>${navLink('/companies', 'Bedrijven', active, 'companies')}` : ''}
     </nav>
     <div class="sb-foot">
-      <strong>${esc(user.name)}</strong>
+      <a href="/profile" style="display:flex;align-items:center;gap:8px;color:#fff;margin-bottom:8px">
+        <img src="/avatar/${user.id}" alt="" style="width:30px;height:30px;border-radius:50%;object-fit:cover">
+        <strong style="margin:0">${esc(user.name)}</strong>
+      </a>
       <form method="post" action="/logout"><input type="hidden" name="csrf" value="${esc(user.csrf)}"><button class="btn btn-sm" style="width:100%">Uitloggen</button></form>
     </div>
   </aside>`;
